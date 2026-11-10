@@ -1,0 +1,264 @@
+name: Build 88x2bu for EVONIX ColorOS V4.5
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-88x2bu
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build 88x2bu module
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      KERNEL_COMMIT: eb8d3bb003ca0505251efea7526e5135181694af
+      EXPECTED_RELEASE: 6.6.142-EVONIX-COS-O+-V4.5
+      DRIVER_REPO: https://github.com/morrownr/88x2bu-20210702.git
+      EVONIX_JOBS: "2"
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/report" "$GITHUB_WORKSPACE/evonix-workspace"
+          test -s "$GITHUB_WORKSPACE/repo/abi/cfg80211.exports.symvers"
+          wc -l "$GITHUB_WORKSPACE/repo/abi/cfg80211.exports.symvers" \
+            | tee "$GITHUB_WORKSPACE/report/cfg80211-lines.txt"
+
+      - name: Free space on disposable runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get clean
+          df -h | tee "$GITHUB_WORKSPACE/report/disk-after-cleanup.txt"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl ca-certificates python3 build-essential bc bison flex \
+            libssl-dev libelf-dev libncurses-dev dwarves rsync unzip zip \
+            zstd file cpio kmod
+          mkdir -p "$HOME/bin"
+          curl --fail --location --retry 3 \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "EVONIX build"
+          git config --global user.email "build@example.invalid"
+
+      - name: Download Android Kleaf workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$GITHUB_WORKSPACE/evonix-workspace"
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b common-android15-6.6-lts --depth=1
+          repo sync -c -j2 --no-tags --fail-fast \
+            2>&1 | tee "$GITHUB_WORKSPACE/report/repo-sync.log"
+
+      - name: Select exact EVONIX ColorOS source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$GITHUB_WORKSPACE/evonix-workspace/common"
+          git remote add evonix https://github.com/NEESCHAL-3/EVONIX-Kernel.git
+          git fetch --depth=1 evonix "$KERNEL_COMMIT"
+          git checkout --detach "$KERNEL_COMMIT"
+          test "$(git rev-parse HEAD)" = "$KERNEL_COMMIT"
+          git submodule update --init --recursive KernelSU-Next
+
+      - name: Install pinned Google Clang
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          WORK="$GITHUB_WORKSPACE/evonix-workspace"
+          cd "$WORK/common"
+          EVONIX_WORKSPACE="$WORK" bash setup-clang23.sh \
+            2>&1 | tee "$GITHUB_WORKSPACE/report/toolchain-setup.log"
+
+      - name: Build baseline kernel
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          WORK="$GITHUB_WORKSPACE/evonix-workspace"
+          cd "$WORK/common"
+          EVONIX_JOBS="$EVONIX_JOBS" bash build-evonix.sh \
+            "$WORK/out/evonix-v4.5" \
+            2>&1 | tee "$GITHUB_WORKSPACE/report/kernel-build.log"
+
+      - name: Locate kernel build tree
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          WORK="$GITHUB_WORKSPACE/evonix-workspace"
+          REPORT="$GITHUB_WORKSPACE/report"
+
+          # Ищем каталог, где есть и .config, и Module.symvers.
+          : > "$REPORT/kernel-out-candidates.txt"
+          KOUT=""
+          while IFS= read -r symvers; do
+            dir="$(dirname "$symvers")"
+            echo "$dir" >> "$REPORT/kernel-out-candidates.txt"
+            if [[ -f "$dir/.config" && -f "$dir/include/generated/utsrelease.h" ]]; then
+              KOUT="$dir"
+              break
+            fi
+          done < <(find "$WORK/out" -type f -name Module.symvers 2>/dev/null)
+
+          if [[ -z "$KOUT" ]]; then
+            echo "No usable kernel output directory found." >&2
+            cat "$REPORT/kernel-out-candidates.txt" >&2 || true
+            exit 1
+          fi
+
+          echo "KOUT=$KOUT" >> "$GITHUB_ENV"
+          echo "$KOUT" | tee "$REPORT/kernel-out-selected.txt"
+          ls -la "$KOUT" | head -n 60 | tee "$REPORT/kernel-out-ls.txt"
+
+          grep -F "\"$EXPECTED_RELEASE\"" "$KOUT/include/generated/utsrelease.h" \
+            | tee "$REPORT/utsrelease-check.txt"
+
+          grep -E '^(CONFIG_MODVERSIONS|CONFIG_MODULE_SIG|CONFIG_CFI_CLANG|CONFIG_LTO_CLANG_THIN|CONFIG_TRIM_UNUSED_KSYMS|CONFIG_CFG80211|CONFIG_USB)=' \
+            "$KOUT/.config" | tee "$REPORT/kernel-config-subset.txt" || true
+
+      - name: Clone driver
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git clone --depth=1 "$DRIVER_REPO" "$GITHUB_WORKSPACE/driver"
+          git -C "$GITHUB_WORKSPACE/driver" log -1 --format=fuller \
+            | tee "$GITHUB_WORKSPACE/report/driver-source.txt"
+          grep -nE '^CONFIG_(WIFI_MONITOR|PLATFORM_I386_PC|PLATFORM_)' \
+            "$GITHUB_WORKSPACE/driver/Makefile" \
+            | tee "$GITHUB_WORKSPACE/report/driver-makefile-config.txt" || true
+
+      - name: Build driver (strict modpost)
+        id: strict
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          WORK="$GITHUB_WORKSPACE/evonix-workspace"
+          CLANG_BIN="$WORK/prebuilts/clang/host/linux-x86/clang-r614150/bin"
+          export PATH="$CLANG_BIN:$PATH"
+
+          # Если инструменты modpost отсутствуют в выходном каталоге, готовим их.
+          if [[ ! -x "$KOUT/scripts/mod/modpost" ]]; then
+            make -C "$WORK/common" O="$KOUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+              HOSTCC=gcc HOSTCXX=g++ modules_prepare \
+              2>&1 | tee "$GITHUB_WORKSPACE/report/modules-prepare.log"
+          fi
+
+          # Платформа драйвера оставлена по умолчанию: KSRC/ARCH задаются Kbuild.
+          make -C "$WORK/common" O="$KOUT" M="$GITHUB_WORKSPACE/driver" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ \
+            KBUILD_EXTRA_SYMBOLS="$GITHUB_WORKSPACE/repo/abi/cfg80211.exports.symvers" \
+            -j2 modules \
+            2>&1 | tee "$GITHUB_WORKSPACE/report/driver-build-strict.log"
+
+          test -s "$GITHUB_WORKSPACE/driver/88x2bu.ko"
+
+      - name: Diagnostic build (unresolved symbols allowed, not for installation)
+        if: steps.strict.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          WORK="$GITHUB_WORKSPACE/evonix-workspace"
+          export PATH="$WORK/prebuilts/clang/host/linux-x86/clang-r614150/bin:$PATH"
+
+          make -C "$WORK/common" O="$KOUT" M="$GITHUB_WORKSPACE/driver" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ \
+            KBUILD_MODPOST_WARN=1 \
+            KBUILD_EXTRA_SYMBOLS="$GITHUB_WORKSPACE/repo/abi/cfg80211.exports.symvers" \
+            -j2 modules \
+            2>&1 | tee "$GITHUB_WORKSPACE/report/driver-build-diagnostic.log"
+
+      - name: Inspect result
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          WORK="$GITHUB_WORKSPACE/evonix-workspace"
+          REPORT="$GITHUB_WORKSPACE/report"
+          KO="$GITHUB_WORKSPACE/driver/88x2bu.ko"
+          NM="$WORK/prebuilts/clang/host/linux-x86/clang-r614150/bin/llvm-nm"
+
+          if [[ ! -s "$KO" ]]; then
+            echo "88x2bu.ko was not produced." | tee "$REPORT/result.txt"
+            exit 0
+          fi
+
+          file "$KO" | tee "$REPORT/ko-file.txt"
+          modinfo -F vermagic "$KO" | tee "$REPORT/ko-vermagic.txt" || true
+          sha256sum "$KO" | tee "$REPORT/ko-sha256.txt"
+
+          "$NM" -u "$KO" | awk '{print $2}' | sort -u > "$REPORT/ko-undefined.txt"
+
+          python3 - "$REPORT" "$KOUT/Module.symvers" \
+            "$GITHUB_WORKSPACE/repo/abi/cfg80211.exports.symvers" <<'PY'
+          import pathlib
+          import sys
+
+          report = pathlib.Path(sys.argv[1])
+          available = set()
+          for path in sys.argv[2:]:
+              for line in open(path, errors="replace"):
+                  parts = line.rstrip("\n").split("\t")
+                  if len(parts) >= 3 and parts[0].startswith("0x"):
+                      available.add(parts[1])
+
+          undefined = [s for s in
+                       (report / "ko-undefined.txt").read_text().split() if s]
+          missing = sorted(s for s in undefined if s not in available)
+
+          (report / "missing-symbols.txt").write_text("\n".join(missing) + "\n")
+          print("undefined:", len(undefined), "missing:", len(missing))
+          PY
+
+          modinfo "$KO" 2>&1 | head -n 40 | tee "$REPORT/ko-modinfo.txt" || true
+
+          if [[ "${{ steps.strict.outcome }}" == "success" ]]; then
+            echo "STRICT BUILD SUCCEEDED (not yet tested on a device)." \
+              | tee "$REPORT/result.txt"
+            mkdir -p "$GITHUB_WORKSPACE/artifact"
+            cp "$KO" "$GITHUB_WORKSPACE/artifact/88x2bu.ko"
+          else
+            echo "Only the diagnostic build produced a module. Do NOT install it." \
+              | tee "$REPORT/result.txt"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 88x2bu-report
+          path: report/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload strict-build module (untested)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 88x2bu-strict-untested
+          path: artifact/88x2bu.ko
+          if-no-files-found: ignore
+          retention-days: 3
