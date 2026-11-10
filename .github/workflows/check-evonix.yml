@@ -8,122 +8,98 @@ permissions:
 
 jobs:
   check:
+    name: Inspect EVONIX ColorOS V4.5
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
+    env:
+      EVONIX_REPO: NEESCHAL-3/EVONIX-Kernel
+      EVONIX_BRANCH: coloros/ksu-susfs
+      RELEASE_TAG: v4.5
+      CLANG_COMMIT: 28337064939c0b4bb5804cddf35fb03d860edcf6
+
     steps:
-      - name: Download ColorOS build files and inspect V4.5
+      - name: Prepare report directory
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/report"
+
+      - name: Download current ColorOS build files
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/report"
           REPORT="$GITHUB_WORKSPACE/report"
-          REPO="NEESCHAL-3/EVONIX-Kernel"
-          BRANCH="coloros/ksu-susfs"
 
-          # Получаем только нужные файлы, а не весь kernel workspace.
+          # Скачиваем выбранные файлы, а не полный workspace.
           git clone \
             --depth=1 \
             --filter=blob:none \
             --sparse \
             --single-branch \
-            --branch "$BRANCH" \
-            "https://github.com/$REPO.git" source
+            --branch "$EVONIX_BRANCH" \
+            "https://github.com/$EVONIX_REPO.git" \
+            source
 
           git -C source sparse-checkout set --no-cone \
             '/README.md' \
-            '/BUILDING.md' \
-            '/BRANCHES.md' \
+            '/SECURITY.md' \
             '/build-evonix.sh' \
             '/setup-clang23.sh' \
             '/BUILD.bazel' \
             '/build.config.constants' \
-            '/arch/arm64/configs/evonix.config'
+            '/arch/arm64/configs/evonix.config' \
+            '/Documentation/evonix/BUILDING.md' \
+            '/Documentation/evonix/BRANCHES.md'
 
           {
-            echo "=== COLOROS BRANCH ==="
+            echo "=== CURRENT COLOROS BRANCH ==="
             git -C source log -1 --format=fuller
             echo
-            echo "NOTE: branch HEAD is not automatically the installed V4.5."
+            echo "Current branch HEAD is not automatically the installed V4.5."
           } | tee "$REPORT/source.txt"
 
-          for file in \
+          for path in \
             README.md \
-            BUILDING.md \
-            BRANCHES.md \
+            SECURITY.md \
             build-evonix.sh \
             setup-clang23.sh \
             BUILD.bazel \
             build.config.constants \
-            arch/arm64/configs/evonix.config
+            arch/arm64/configs/evonix.config \
+            Documentation/evonix/BUILDING.md \
+            Documentation/evonix/BRANCHES.md
           do
-            if [[ -f "source/$file" ]]; then
-              mkdir -p "$REPORT/files/$(dirname "$file")"
-              cp "source/$file" "$REPORT/files/$file"
+            if [[ -f "source/$path" ]]; then
+              mkdir -p "$REPORT/files/$(dirname "$path")"
+              cp "source/$path" "$REPORT/files/$path"
+            else
+              echo "Missing in current branch: $path" \
+                >> "$REPORT/missing-files.txt"
             fi
           done
 
-          # Сохраняем сведения о release tag и его assets.
-          # Отсутствие релиза не подменяем выбором текущей ветки.
-          if gh api "repos/$REPO/releases/tags/v4.5" \
-              > "$REPORT/release-v4.5.json" \
-              2> "$REPORT/release-error.txt"; then
-            python3 - "$REPORT/release-v4.5.json" <<'PY' \
-              | tee "$REPORT/release-summary.txt"
-          import json
-          import sys
+          # Отдельные копии для удобного прикрепления с телефона.
+          for name in BUILDING BRANCHES; do
+            path="source/Documentation/evonix/$name.md"
+            if [[ -f "$path" ]]; then
+              cp "$path" "$REPORT/inspect-$name.md"
+            fi
+          done
 
-          with open(sys.argv[1]) as f:
-              release = json.load(f)
-
-          for key in ("tag_name", "target_commitish", "published_at", "html_url"):
-              print(f"{key}: {release.get(key)}")
-          print("\nAssets:")
-          for asset in release.get("assets", []):
-              print(asset["name"], asset["browser_download_url"])
-          print("\nRelease notes:")
-          print(release.get("body") or "")
-          PY
-          else
-            echo "Release metadata unavailable; inspect release-error.txt." \
-              | tee "$REPORT/release-summary.txt"
+          if [[ -f source/SECURITY.md ]]; then
+            cp source/SECURITY.md "$REPORT/inspect-SECURITY.md"
           fi
 
           git ls-remote \
-            "https://github.com/$REPO.git" \
-            'refs/tags/v4.5*' \
-            'refs/heads/coloros/ksu-susfs' \
+            "https://github.com/$EVONIX_REPO.git" \
+            "refs/tags/$RELEASE_TAG" \
+            "refs/tags/$RELEASE_TAG^{}" \
+            "refs/heads/$EVONIX_BRANCH" \
             | tee "$REPORT/remote-refs.txt"
 
-      - name: Check pinned Google Clang commit
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          REPORT="$GITHUB_WORKSPACE/report"
-          COMMIT="28337064939c0b4bb5804cddf35fb03d860edcf6"
-          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
-
-          # Проверяем наличие каталога в указанном commit.
-          # Бинарники пока не скачиваем и не запускаем.
-          if curl --fail --location --retry 2 \
-              "$BASE/+/$COMMIT/clang-r614150/?format=JSON" \
-              -o "$REPORT/clang-directory.json" \
-              2> "$REPORT/clang-check-error.txt"; then
-            echo "Pinned Clang directory is accessible." \
-              | tee "$REPORT/clang-status.txt"
-          else
-            echo "Pinned Clang directory could not be retrieved." \
-              | tee "$REPORT/clang-status.txt"
-            echo "Do not substitute a different compiler automatically."
-          fi
-
-      - name: Upload diagnostic report
-      
-      - name: Inspect ColorOS release history
+      - name: Inspect V4.5 release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -131,54 +107,171 @@ jobs:
           set -Eeuo pipefail
 
           REPORT="$GITHUB_WORKSPACE/report"
-          REPO="NEESCHAL-3/EVONIX-Kernel"
-          BRANCH="coloros/ksu-susfs"
 
-          # Ищем исторические commits, а не выбираем текущий HEAD.
-          # Дата ограничивает поиск; сама по себе она не доказывает,
-          # что конкретный commit использовался для release binary.
-          gh api --method GET "repos/$REPO/commits" \
-            -f sha="$BRANCH" \
-            -f until="2026-10-13T12:22:15Z" \
-            -f per_page=20 \
-            > "$REPORT/coloros-history.json"
+          if gh api \
+              "repos/$EVONIX_REPO/releases/tags/$RELEASE_TAG" \
+              > "$REPORT/release-v4.5.json" \
+              2> "$REPORT/release-error.txt"; then
 
-          python3 - "$REPORT/coloros-history.json" <<'PY' \
-            | tee "$REPORT/coloros-history.txt"
+            python3 - "$REPORT" <<'PY'
           import json
+          import pathlib
           import sys
 
-          with open(sys.argv[1]) as f:
-              commits = json.load(f)
+          report = pathlib.Path(sys.argv[1])
+          release = json.loads(
+              (report / "release-v4.5.json").read_text()
+          )
+
+          lines = []
+          for key in (
+              "tag_name",
+              "target_commitish",
+              "published_at",
+              "html_url",
+          ):
+              lines.append(f"{key}: {release.get(key)}")
+
+          lines.append("\nAssets:")
+          for asset in release.get("assets", []):
+              lines.append(
+                  f"{asset['name']} {asset['browser_download_url']}"
+              )
+
+          lines.append("\nRelease notes:")
+          lines.append(release.get("body") or "")
+
+          text = "\n".join(lines) + "\n"
+          (report / "release-summary.txt").write_text(text)
+          print(text)
+
+          published = release.get("published_at")
+          if published:
+              (report / "release-published-at.txt").write_text(
+                  published + "\n"
+              )
+          PY
+
+          else
+            echo "Release metadata unavailable. See release-error.txt." \
+              | tee "$REPORT/release-summary.txt"
+          fi
+
+      - name: Inspect historical ColorOS commits
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          REPORT="$GITHUB_WORKSPACE/report"
+
+          if [[ ! -s "$REPORT/release-published-at.txt" ]]; then
+            echo "Release date unavailable; history lookup skipped." \
+              | tee "$REPORT/coloros-history.txt"
+            exit 0
+          fi
+
+          UNTIL="$(cat "$REPORT/release-published-at.txt")"
+
+          # Дата ограничивает поиск, но не доказывает соответствие
+          # конкретного commit установленному release binary.
+          if gh api --method GET \
+              "repos/$EVONIX_REPO/commits" \
+              -f sha="$EVONIX_BRANCH" \
+              -f until="$UNTIL" \
+              -f per_page=30 \
+              > "$REPORT/coloros-history.json" \
+              2> "$REPORT/history-error.txt"; then
+
+            python3 - "$REPORT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          report = pathlib.Path(sys.argv[1])
+          commits = json.loads(
+              (report / "coloros-history.json").read_text()
+          )
+
+          lines = [
+              "Historical ColorOS commits before release publication.",
+              "These are candidates, not verified release source commits.",
+              "",
+          ]
 
           for item in commits:
               commit = item["commit"]
-              print("SHA:", item["sha"])
-              print("Date:", commit["committer"]["date"])
-              print(commit["message"])
-              print("-" * 60)
+              lines.extend([
+                  f"SHA: {item['sha']}",
+                  f"Date: {commit['committer']['date']}",
+                  commit["message"],
+                  "-" * 60,
+              ])
+
+          if not commits:
+              lines.append("No matching commits returned.")
+
+          text = "\n".join(lines) + "\n"
+          (report / "coloros-history.txt").write_text(text)
+          print(text)
           PY
 
-          # README указывает на Documentation/evonix/,
-          # а не на BUILDING.md в корне репозитория.
-          for path in \
-            Documentation/evonix/BRANCHES.md \
-            Documentation/evonix/BUILDING.md \
-            SECURITY.md
-          do
-            name="$(basename "$path")"
-            if gh api --method GET \
-                -H "Accept: application/vnd.github.raw+json" \
-                "repos/$REPO/contents/$path" \
-                -f ref="$BRANCH" \
-                > "$REPORT/inspect-$name"; then
-              echo "Downloaded: $path"
-            else
-              echo "Could not retrieve: $path" \
-                >> "$REPORT/history-warnings.txt"
-            fi
-          done
-      
+          else
+            echo "History lookup failed. See history-error.txt." \
+              | tee "$REPORT/coloros-history.txt"
+          fi
+
+      - name: Check pinned Google Clang directory
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          REPORT="$GITHUB_WORKSPACE/report"
+          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+
+          # Проверяем каталог без скачивания/запуска компилятора.
+          if curl \
+              --fail \
+              --location \
+              --retry 2 \
+              --connect-timeout 20 \
+              --max-time 120 \
+              "$BASE/+/$CLANG_COMMIT/clang-r614150/?format=JSON" \
+              -o "$REPORT/clang-directory.json" \
+              2> "$REPORT/clang-check-error.txt"; then
+
+            echo "Pinned Clang directory is accessible." \
+              | tee "$REPORT/clang-status.txt"
+
+          else
+            {
+              echo "Pinned Clang directory could not be retrieved."
+              echo "Do not substitute another compiler automatically."
+            } | tee "$REPORT/clang-status.txt"
+          fi
+
+      - name: Write workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## EVONIX diagnostic report"
+            echo
+            echo "No kernel or driver was compiled."
+            echo "No downloaded EVONIX script was executed."
+            echo
+            echo "Download the evonix-build-inputs artifact."
+            echo
+            echo "Files to inspect first:"
+            echo "- coloros-history.txt"
+            echo "- inspect-BRANCHES.md"
+            echo "- inspect-SECURITY.md"
+            echo "- source.txt"
+            echo "- release-summary.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostic report
         if: always()
         uses: actions/upload-artifact@v4
         with:
