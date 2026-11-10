@@ -33,9 +33,42 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p "$GITHUB_WORKSPACE/report" "$GITHUB_WORKSPACE/evonix-workspace"
-          test -s "$GITHUB_WORKSPACE/repo/abi/cfg80211.exports.symvers"
-          wc -l "$GITHUB_WORKSPACE/repo/abi/cfg80211.exports.symvers" \
-            | tee "$GITHUB_WORKSPACE/report/cfg80211-lines.txt"
+
+          python3 - "$GITHUB_WORKSPACE/repo/abi/cfg80211.exports.symvers" \
+            "$GITHUB_WORKSPACE/report" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          report = pathlib.Path(sys.argv[2])
+
+          out = []
+          bad = []
+          for number, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+              parts = line.split()
+              if not parts:
+                  continue
+              if len(parts) < 2 or not re.fullmatch(r"0x[0-9a-fA-F]{8}", parts[0]):
+                  bad.append(f"{number}: {line}")
+                  continue
+              crc = "0x%08x" % int(parts[0], 16)
+              out.append(f"{crc}\t{parts[1]}\tcfg80211\tEXPORT_SYMBOL_GPL\t\n")
+
+          (report / "cfg80211-normalize.txt").write_text(
+              f"valid lines: {len(out)}\nbad lines: {len(bad)}\n" + "\n".join(bad) + "\n"
+          )
+          print("valid:", len(out), "bad:", len(bad))
+          if bad or len(out) != 150:
+              raise SystemExit(
+                  "cfg80211 table is incomplete or malformed; expected 150 valid lines."
+              )
+
+          path.write_text("".join(out))
+          PY
+
+          head -n 3 "$GITHUB_WORKSPACE/repo/abi/cfg80211.exports.symvers" | cat -A \
+            | tee "$GITHUB_WORKSPACE/report/cfg80211-head.txt"
 
       - name: Free space on disposable runner
         shell: bash
