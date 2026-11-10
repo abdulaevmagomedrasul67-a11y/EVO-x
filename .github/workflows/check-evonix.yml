@@ -122,6 +122,63 @@ jobs:
           fi
 
       - name: Upload diagnostic report
+      
+      - name: Inspect ColorOS release history
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          REPORT="$GITHUB_WORKSPACE/report"
+          REPO="NEESCHAL-3/EVONIX-Kernel"
+          BRANCH="coloros/ksu-susfs"
+
+          # Ищем исторические commits, а не выбираем текущий HEAD.
+          # Дата ограничивает поиск; сама по себе она не доказывает,
+          # что конкретный commit использовался для release binary.
+          gh api --method GET "repos/$REPO/commits" \
+            -f sha="$BRANCH" \
+            -f until="2026-10-13T12:22:15Z" \
+            -f per_page=20 \
+            > "$REPORT/coloros-history.json"
+
+          python3 - "$REPORT/coloros-history.json" <<'PY' \
+            | tee "$REPORT/coloros-history.txt"
+          import json
+          import sys
+
+          with open(sys.argv[1]) as f:
+              commits = json.load(f)
+
+          for item in commits:
+              commit = item["commit"]
+              print("SHA:", item["sha"])
+              print("Date:", commit["committer"]["date"])
+              print(commit["message"])
+              print("-" * 60)
+          PY
+
+          # README указывает на Documentation/evonix/,
+          # а не на BUILDING.md в корне репозитория.
+          for path in \
+            Documentation/evonix/BRANCHES.md \
+            Documentation/evonix/BUILDING.md \
+            SECURITY.md
+          do
+            name="$(basename "$path")"
+            if gh api --method GET \
+                -H "Accept: application/vnd.github.raw+json" \
+                "repos/$REPO/contents/$path" \
+                -f ref="$BRANCH" \
+                > "$REPORT/inspect-$name"; then
+              echo "Downloaded: $path"
+            else
+              echo "Could not retrieve: $path" \
+                >> "$REPORT/history-warnings.txt"
+            fi
+          done
+      
         if: always()
         uses: actions/upload-artifact@v4
         with:
