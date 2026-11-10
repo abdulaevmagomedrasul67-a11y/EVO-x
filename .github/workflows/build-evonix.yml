@@ -1,0 +1,321 @@
+name: Build EVONIX ColorOS V4.5 baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evonix-baseline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build pinned ColorOS kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      KERNEL_COMMIT: eb8d3bb003ca0505251efea7526e5135181694af
+      EXPECTED_RELEASE: 6.6.142-EVONIX-COS-O+-V4.5
+      EVONIX_JOBS: "2"
+
+    steps:
+      - name: Prepare directories
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/report"
+          mkdir -p "$GITHUB_WORKSPACE/evonix-workspace"
+
+          {
+            echo "Kernel commit: $KERNEL_COMMIT"
+            echo "Expected release: $EXPECTED_RELEASE"
+            echo
+            echo "Workspace projects are synced from the documented branch."
+            echo "Original release workspace revisions are not yet known."
+            echo "This is a baseline build, not proof of binary compatibility."
+          } > "$GITHUB_WORKSPACE/report/build-info.txt"
+
+          df -h | tee "$GITHUB_WORKSPACE/report/disk-before.txt"
+          free -h | tee "$GITHUB_WORKSPACE/report/memory.txt"
+
+      - name: Free space on disposable runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # These paths belong to the disposable GitHub runner.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc
+
+          sudo apt-get clean
+
+          df -h | tee "$GITHUB_WORKSPACE/report/disk-after-cleanup.txt"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git \
+            curl \
+            ca-certificates \
+            python3 \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            dwarves \
+            rsync \
+            unzip \
+            zip \
+            zstd \
+            file \
+            cpio \
+            kmod
+
+          mkdir -p "$HOME/bin"
+
+          curl --fail --location --retry 3 \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$HOME/bin/repo"
+
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+          git config --global user.name "EVONIX build"
+          git config --global user.email "build@example.invalid"
+
+      - name: Download Android Kleaf workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$GITHUB_WORKSPACE/evonix-workspace"
+          REPORT="$GITHUB_WORKSPACE/report"
+
+          repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b common-android15-6.6-lts \
+            --depth=1
+
+          repo sync \
+            -c \
+            -j2 \
+            --no-tags \
+            --fail-fast \
+            2>&1 | tee "$REPORT/repo-sync.log"
+
+          repo manifest -r > "$REPORT/resolved-manifest.xml"
+
+          df -h | tee "$REPORT/disk-after-sync.txt"
+
+      - name: Select exact EVONIX ColorOS source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$GITHUB_WORKSPACE/evonix-workspace/common"
+          REPORT="$GITHUB_WORKSPACE/report"
+
+          git remote add evonix \
+            https://github.com/NEESCHAL-3/EVONIX-Kernel.git
+
+          git fetch --depth=1 evonix "$KERNEL_COMMIT"
+          git checkout --detach "$KERNEL_COMMIT"
+
+          ACTUAL="$(git rev-parse HEAD)"
+
+          if [[ "$ACTUAL" != "$KERNEL_COMMIT" ]]; then
+            echo "Unexpected source commit: $ACTUAL" >&2
+            exit 1
+          fi
+
+          git submodule update --init --recursive KernelSU-Next \
+            2>&1 | tee "$REPORT/submodules.log"
+
+          git log -1 --format=fuller \
+            | tee "$REPORT/kernel-source.txt"
+
+          git submodule status --recursive \
+            | tee "$REPORT/submodule-revisions.txt"
+
+          cd ..
+          repo manifest -r > "$REPORT/resolved-manifest.xml"
+
+      - name: Verify build scripts exist at release commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$GITHUB_WORKSPACE/evonix-workspace/common"
+          REPORT="$GITHUB_WORKSPACE/report"
+
+          for path in \
+            build-evonix.sh \
+            setup-clang23.sh \
+            build.config.constants \
+            arch/arm64/configs/evonix.config
+          do
+            if [[ ! -f "$path" ]]; then
+              echo "Missing at pinned release commit: $path" \
+                | tee -a "$REPORT/missing-build-files.txt"
+              exit 1
+            fi
+          done
+
+          # Do not replace missing release files with current versions.
+          cp build-evonix.sh "$REPORT/"
+          cp setup-clang23.sh "$REPORT/"
+          cp arch/arm64/configs/evonix.config "$REPORT/"
+
+          bash -n build-evonix.sh
+          bash -n setup-clang23.sh
+
+      - name: Install pinned Google Clang
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORK="$GITHUB_WORKSPACE/evonix-workspace"
+          REPORT="$GITHUB_WORKSPACE/report"
+
+          cd "$WORK/common"
+
+          EVONIX_WORKSPACE="$WORK" \
+            bash setup-clang23.sh \
+            2>&1 | tee "$REPORT/toolchain-setup.log"
+
+          "$WORK/prebuilts/clang/host/linux-x86/clang-r614150/bin/clang" \
+            --version | tee "$REPORT/clang-version.txt"
+
+      - name: Build baseline kernel
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORK="$GITHUB_WORKSPACE/evonix-workspace"
+          REPORT="$GITHUB_WORKSPACE/report"
+          DIST="$WORK/out/evonix-v4.5"
+
+          cd "$WORK/common"
+
+          EVONIX_JOBS="$EVONIX_JOBS" \
+            bash build-evonix.sh "$DIST" \
+            2>&1 | tee "$REPORT/kernel-build.log"
+
+      - name: Inspect distribution and release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORK="$GITHUB_WORKSPACE/evonix-workspace"
+          REPORT="$GITHUB_WORKSPACE/report"
+          DIST="$WORK/out/evonix-v4.5"
+
+          test -s "$DIST/Image"
+          test -s "$DIST/vmlinux"
+
+          find "$DIST" -maxdepth 2 -type f -printf '%P %s bytes\n' \
+            | sort | tee "$REPORT/dist-files.txt"
+
+          python3 - "$DIST/vmlinux" "$REPORT" "$EXPECTED_RELEASE" <<'PY'
+          import mmap
+          import pathlib
+          import re
+          import sys
+
+          binary = pathlib.Path(sys.argv[1])
+          report = pathlib.Path(sys.argv[2])
+          expected = sys.argv[3]
+
+          with binary.open("rb") as f:
+              with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                  match = re.search(rb"Linux version [^\x00\n]+", data)
+                  if not match:
+                      raise SystemExit("Linux version string not found.")
+
+                  banner = match.group().decode("utf-8", errors="replace")
+
+          print(banner)
+          (report / "built-kernel-version.txt").write_text(banner + "\n")
+
+          release = banner.split()[2]
+          if release != expected:
+              raise SystemExit(
+                  f"Release mismatch: {release!r}; expected {expected!r}. "
+                  "Do not patch the version string to hide this."
+              )
+          PY
+
+          if [[ -f "$DIST/embedded.config" ]]; then
+            cp "$DIST/embedded.config" "$REPORT/"
+          fi
+
+          (
+            cd "$DIST"
+            find . -maxdepth 1 -type f -print0 \
+              | sort -z \
+              | xargs -0 -r sha256sum
+          ) > "$REPORT/dist-sha256.txt"
+
+          find "$WORK/out" \
+            -type f \
+            -name Module.symvers \
+            -print \
+            > "$REPORT/symvers-locations.txt"
+
+      - name: Package baseline distribution
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORK="$GITHUB_WORKSPACE/evonix-workspace"
+          REPORT="$GITHUB_WORKSPACE/report"
+
+          # Build results only. Not an installation package.
+          tar --use-compress-program='zstd -T2 -3' \
+            -cf "$GITHUB_WORKSPACE/evonix-baseline.tar.zst" \
+            -C "$WORK/out" \
+            evonix-v4.5
+
+          sha256sum "$GITHUB_WORKSPACE/evonix-baseline.tar.zst" \
+            > "$REPORT/baseline-archive-sha256.txt"
+
+      - name: Record final resource usage
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/report"
+          df -h > "$GITHUB_WORKSPACE/report/disk-final.txt"
+          free -h > "$GITHUB_WORKSPACE/report/memory-final.txt"
+
+      - name: Upload build report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evonix-baseline-report
+          path: report/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+
+      - name: Upload successful baseline distribution
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evonix-baseline-dist
+          path: evonix-baseline.tar.zst
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
