@@ -1,0 +1,131 @@
+name: Check EVONIX build inputs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Download ColorOS build files and inspect V4.5
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/report"
+          REPORT="$GITHUB_WORKSPACE/report"
+          REPO="NEESCHAL-3/EVONIX-Kernel"
+          BRANCH="coloros/ksu-susfs"
+
+          # Получаем только нужные файлы, а не весь kernel workspace.
+          git clone \
+            --depth=1 \
+            --filter=blob:none \
+            --sparse \
+            --single-branch \
+            --branch "$BRANCH" \
+            "https://github.com/$REPO.git" source
+
+          git -C source sparse-checkout set --no-cone \
+            '/README.md' \
+            '/BUILDING.md' \
+            '/BRANCHES.md' \
+            '/build-evonix.sh' \
+            '/setup-clang23.sh' \
+            '/BUILD.bazel' \
+            '/build.config.constants' \
+            '/arch/arm64/configs/evonix.config'
+
+          {
+            echo "=== COLOROS BRANCH ==="
+            git -C source log -1 --format=fuller
+            echo
+            echo "NOTE: branch HEAD is not automatically the installed V4.5."
+          } | tee "$REPORT/source.txt"
+
+          for file in \
+            README.md \
+            BUILDING.md \
+            BRANCHES.md \
+            build-evonix.sh \
+            setup-clang23.sh \
+            BUILD.bazel \
+            build.config.constants \
+            arch/arm64/configs/evonix.config
+          do
+            if [[ -f "source/$file" ]]; then
+              mkdir -p "$REPORT/files/$(dirname "$file")"
+              cp "source/$file" "$REPORT/files/$file"
+            fi
+          done
+
+          # Сохраняем сведения о release tag и его assets.
+          # Отсутствие релиза не подменяем выбором текущей ветки.
+          if gh api "repos/$REPO/releases/tags/v4.5" \
+              > "$REPORT/release-v4.5.json" \
+              2> "$REPORT/release-error.txt"; then
+            python3 - "$REPORT/release-v4.5.json" <<'PY' \
+              | tee "$REPORT/release-summary.txt"
+          import json
+          import sys
+
+          with open(sys.argv[1]) as f:
+              release = json.load(f)
+
+          for key in ("tag_name", "target_commitish", "published_at", "html_url"):
+              print(f"{key}: {release.get(key)}")
+          print("\nAssets:")
+          for asset in release.get("assets", []):
+              print(asset["name"], asset["browser_download_url"])
+          print("\nRelease notes:")
+          print(release.get("body") or "")
+          PY
+          else
+            echo "Release metadata unavailable; inspect release-error.txt." \
+              | tee "$REPORT/release-summary.txt"
+          fi
+
+          git ls-remote \
+            "https://github.com/$REPO.git" \
+            'refs/tags/v4.5*' \
+            'refs/heads/coloros/ksu-susfs' \
+            | tee "$REPORT/remote-refs.txt"
+
+      - name: Check pinned Google Clang commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          REPORT="$GITHUB_WORKSPACE/report"
+          COMMIT="28337064939c0b4bb5804cddf35fb03d860edcf6"
+          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+
+          # Проверяем наличие каталога в указанном commit.
+          # Бинарники пока не скачиваем и не запускаем.
+          if curl --fail --location --retry 2 \
+              "$BASE/+/$COMMIT/clang-r614150/?format=JSON" \
+              -o "$REPORT/clang-directory.json" \
+              2> "$REPORT/clang-check-error.txt"; then
+            echo "Pinned Clang directory is accessible." \
+              | tee "$REPORT/clang-status.txt"
+          else
+            echo "Pinned Clang directory could not be retrieved." \
+              | tee "$REPORT/clang-status.txt"
+            echo "Do not substitute a different compiler automatically."
+          fi
+
+      - name: Upload diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evonix-build-inputs
+          path: report/
+          if-no-files-found: warn
+          retention-days: 7
